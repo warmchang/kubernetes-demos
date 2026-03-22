@@ -53,13 +53,14 @@ func (bh *BidHandler) HandleBid(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check cache for campaign data
-	cacheKey := fmt.Sprintf("campaign:%s:%s", req.AdSlotID, req.UserSegment)
+	cacheKey := fmt.Sprintf("campaign:%s:%s:%s", req.AdSlotID, req.UserSegment, req.GeoCountry)
 	cachedBid, found := bh.cache.Get(cacheKey)
 	if found {
 		bh.metrics.RecordCacheHit("bid")
 		resp := cachedBid.(*model.BidResponse)
 		bh.metrics.RecordBid(resp.BidCents)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
 		json.NewEncoder(w).Encode(resp)
 		return
 	}
@@ -77,11 +78,61 @@ func (bh *BidHandler) HandleBid(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cache", "MISS")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// HandleBulkBid processes multiple bid requests in a single call
+func (bh *BidHandler) HandleBulkBid(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		bh.metrics.RecordLatency("bulk_bid", time.Since(start))
+	}()
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var reqs []model.BidRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
+		bh.metrics.RecordError("bulk_bid", "invalid_request")
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if len(reqs) > 10 {
+		http.Error(w, "Maximum 10 bids per bulk request", http.StatusBadRequest)
+		return
+	}
+
+	responses := make([]*model.BidResponse, 0, len(reqs))
+	for _, req := range reqs {
+		resp := bh.computeBid(&req)
+		if resp.BidCents > 0 {
+			cacheKey := fmt.Sprintf("campaign:%s:%s:%s", req.AdSlotID, req.UserSegment, req.GeoCountry)
+			bh.cache.Set(cacheKey, resp)
+			bh.metrics.RecordBid(resp.BidCents)
+		} else {
+			bh.metrics.RecordNoBid()
+		}
+		responses = append(responses, resp)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(responses)
 }
 
 func (bh *BidHandler) computeBid(req *model.BidRequest) *model.BidResponse {
 	baseBid := bh.calculateBaseBid(req)
+
+	// Apply geo targeting modifier
+	if bh.cfg.GeoTargeting && req.GeoCountry != "" {
+		baseBid = applyGeoModifier(baseBid, req.GeoCountry)
+	}
+
+	// Apply device modifier
+	baseBid = applyDeviceModifier(baseBid, req.DeviceType)
 
 	if baseBid < bh.cfg.MinBidFloor {
 		return &model.BidResponse{
@@ -98,8 +149,8 @@ func (bh *BidHandler) computeBid(req *model.BidRequest) *model.BidResponse {
 	return &model.BidResponse{
 		BidID:      generateBidID(),
 		BidCents:   baseBid,
-		AdMarkup:   fmt.Sprintf("<ad campaign='%s' />", req.CampaignID),
-		CreativeID: fmt.Sprintf("cr_%s", req.AdSlotID),
+		AdMarkup:   fmt.Sprintf("<ad campaign='%s' slot='%s' />", req.CampaignID, req.AdSlotID),
+		CreativeID: fmt.Sprintf("cr_%s_%s", req.AdSlotID, req.UserSegment),
 		NoBid:      false,
 	}
 }
@@ -114,9 +165,11 @@ func (bh *BidHandler) calculateBaseBid(req *model.BidRequest) int {
 		base = 150
 	case "retarget":
 		base = 300
+	case "lookalike":
+		base = 200
 	}
 
-	// Apply slot modifier
+	// Apply slot size modifier
 	switch req.AdSlotSize {
 	case "728x90":
 		base = int(float64(base) * 0.8)
@@ -124,9 +177,43 @@ func (bh *BidHandler) calculateBaseBid(req *model.BidRequest) int {
 		base = int(float64(base) * 1.2)
 	case "160x600":
 		base = int(float64(base) * 0.9)
+	case "320x50":
+		base = int(float64(base) * 0.7)
+	case "970x250":
+		base = int(float64(base) * 1.4)
 	}
 
 	return base
+}
+
+func applyGeoModifier(bid int, country string) int {
+	modifiers := map[string]float64{
+		"US": 1.0,
+		"UK": 0.95,
+		"DE": 0.90,
+		"FR": 0.88,
+		"JP": 1.10,
+		"AU": 0.92,
+		"CA": 0.97,
+		"BR": 0.70,
+	}
+	if m, ok := modifiers[country]; ok {
+		return int(float64(bid) * m)
+	}
+	return int(float64(bid) * 0.75)
+}
+
+func applyDeviceModifier(bid int, device string) int {
+	modifiers := map[string]float64{
+		"mobile":  1.15,
+		"desktop": 1.0,
+		"tablet":  0.90,
+		"ctv":     1.30,
+	}
+	if m, ok := modifiers[device]; ok {
+		return int(float64(bid) * m)
+	}
+	return bid
 }
 
 func validateBidRequest(req *model.BidRequest) error {
@@ -136,6 +223,9 @@ func validateBidRequest(req *model.BidRequest) error {
 	if req.UserSegment == "" {
 		return fmt.Errorf("user_segment is required")
 	}
+	if req.RequestID == "" {
+		return fmt.Errorf("request_id is required")
+	}
 	return nil
 }
 
@@ -144,5 +234,5 @@ func generateBidID() string {
 }
 
 func init() {
-	log.Println("Bid handler initialized")
+	log.Println("Bid handler v2.4.1 initialized")
 }

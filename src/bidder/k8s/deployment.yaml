@@ -4,25 +4,34 @@ metadata:
   name: bidder-service
   labels:
     app: bidder-service
+    version: v2.4.1
+  annotations:
+    kubernetes.io/change-cause: "v2.4.1 - geo targeting, bulk bids, pacing support"
 spec:
-  replicas: 3
+  replicas: 5
   selector:
     matchLabels:
       app: bidder-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 1
   template:
     metadata:
       labels:
         app: bidder-service
-        version: v2.4.0
+        version: v2.4.1
     spec:
       containers:
         - name: bidder
-          image: robusta/bidder-service:v2.4.0
+          image: robusta/bidder-service:v2.4.1
           ports:
             - containerPort: 8080
+              name: http
           env:
             - name: VERSION
-              value: "2.4.0"
+              value: "2.4.1"
             - name: CACHE_TTL
               value: "5m"
             - name: MAX_BID_CENTS
@@ -31,13 +40,17 @@ spec:
               value: "100ms"
             - name: LOG_LEVEL
               value: "info"
+            - name: ENABLE_PACING
+              value: "true"
+            - name: GEO_TARGETING
+              value: "true"
           resources:
             requests:
-              cpu: 250m
-              memory: 128Mi
-            limits:
               cpu: 500m
               memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
           livenessProbe:
             httpGet:
               path: /health
